@@ -1,0 +1,28 @@
+# Environment / secrets — NEVER commit these
+.env
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor
+.idea/
+.vscode/
+*.swp

@@ -257,10 +257,12 @@ class RiskGuardRunner:
             lambda: guard_position_size(signal.recommended_size_usd),
             lambda: guard_stale_data(market),
             lambda: guard_probability_bounds(signal.implied_probability),
-            lambda: guard_liquidity(vol_24h),
             lambda: guard_correlation(market, signal.recommended_size_usd, portfolio),
             lambda: guard_aroc(signal.aroc_annual),
         ]
+        # Liquidity guard only applies in live mode — paper trading doesn't move markets
+        if is_live_order:
+            guards_to_run.append(lambda: guard_liquidity(vol_24h))
 
         if market.exchange == Exchange.POLYMARKET:
             guards_to_run.append(lambda: guard_gas_price(current_gas_gwei))
@@ -306,7 +308,8 @@ class RiskGuardRunner:
         for market in markets:
             results.append(guard_stale_data(market))
             yes = market.yes_outcome
-            if yes:
+            # Liquidity guard only in live mode — paper trades don't move markets
+            if is_live_order and yes:
                 results.append(guard_liquidity(yes.volume_24h))
             if market.exchange == Exchange.POLYMARKET:
                 results.append(guard_gas_price(current_gas_gwei))

@@ -81,6 +81,13 @@ class OrderRouter:
         """
         is_live = self._settings.is_live
 
+        logger.info(
+            "RISK CHECK — %s [%s] %s | true=%.1f%% implied=%.1f%% edge=%.1f%% size=$%.2f",
+            signal.alpha_type.value, market.market_id[:24], signal.side.value,
+            signal.true_probability * 100, signal.implied_probability * 100,
+            signal.edge * 100, signal.recommended_size_usd,
+        )
+
         try:
             self._guards.run_directional(
                 signal=signal,
@@ -91,9 +98,10 @@ class OrderRouter:
                 is_live_order=is_live,
             )
         except Exception as exc:
-            logger.warning("Signal blocked by risk guard: %s", exc)
+            logger.warning("  BLOCKED — %s", exc)
             return None
 
+        logger.info("  PASSED all risk guards — placing order")
         adapter = self._adapter_for(market.exchange)
         order_type = OrderType(self._settings.default_order_type.value.lower())
 
@@ -110,13 +118,14 @@ class OrderRouter:
 
         if order.status == OrderStatus.FILLED:
             logger.info(
-                "Signal executed: %s %s $%.2f edge=%.1f%% EV=$%.2f",
-                signal.side.value,
-                market.title[:40],
-                order.filled_size_usd,
-                signal.edge * 100,
-                signal.expected_value_usd,
+                "  FILLED — %s %s '%s' $%.2f @ %.1f%% | edge=%.1f%% EV=$%.2f",
+                signal.side.value, market.exchange.value,
+                market.title[:35], order.filled_size_usd,
+                signal.implied_probability * 100,
+                signal.edge * 100, signal.expected_value_usd,
             )
+        else:
+            logger.warning("  ORDER NOT FILLED — status=%s", order.status.value)
 
         return order
 

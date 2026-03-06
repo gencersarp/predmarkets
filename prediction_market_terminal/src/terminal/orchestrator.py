@@ -306,14 +306,27 @@ class TradingOrchestrator:
         if not markets:
             return
 
+        poly_markets = [m for m in markets if m.exchange == Exchange.POLYMARKET]
+        kalshi_markets = [m for m in markets if m.exchange == Exchange.KALSHI]
+        logger.info(
+            "ARB SCAN — checking %d Polymarket × %d Kalshi markets for price discrepancies",
+            len(poly_markets), len(kalshi_markets),
+        )
+
         opportunities = self._arb_scanner.scan(markets)
         self.latest_arb_opportunities = opportunities[:20]
+
+        if not opportunities:
+            logger.info("ARB SCAN — no opportunities found (markets are efficiently priced)")
+        else:
+            logger.info("ARB SCAN — found %d opportunities (%d actionable)",
+                        len(opportunities), sum(1 for o in opportunities if o.is_actionable))
 
         for opp in opportunities[:5]:  # log top 5
             await self._db.log_arb_opportunity(opp)
             if opp.is_actionable:
                 logger.info(
-                    "ARB %s net_edge=$%.2f aroc=%.0f%% flags=%s",
+                    "ARB EXECUTE — type=%s net_edge=$%.2f aroc=%.0f%% flags=%s",
                     opp.alpha_type.value,
                     opp.net_edge_usd,
                     opp.aroc_annual * 100,
@@ -329,9 +342,10 @@ class TradingOrchestrator:
         if not markets:
             return
 
+        logger.info("SIGNAL SCAN — evaluating %d markets across 3 strategies", len(markets))
         all_signals: list[DirectionalSignal] = []
 
-        # 1. EV-based fundamental signals
+        # 1. EV-based fundamental signals (requires oracle/news data)
         oracle_map: dict[str, list[OracleEstimate]] = {}
         for market in markets:
             estimates = await self._state.get_oracle_estimates(market.market_id)
@@ -339,21 +353,44 @@ class TradingOrchestrator:
                 oracle_map[market.market_id] = estimates
 
         if oracle_map:
+            logger.info(
+                "  [1/3] FUNDAMENTAL EV — oracle data for %d/%d markets",
+                len(oracle_map), len(markets),
+            )
             nav = self._portfolio.nav
             ev_signals = self._ev_engine.evaluate_universe(markets, oracle_map, nav)
             all_signals.extend(ev_signals)
+            logger.info("  [1/3] FUNDAMENTAL EV — %d signals generated", len(ev_signals))
+        else:
+            logger.info(
+                "  [1/3] FUNDAMENTAL EV — skipped (no oracle data; set NEWSAPI_KEY to enable)"
+            )
 
-        # 2. Time-decay signals (for Poisson-type markets)
-        for market in markets:
-            if not market.expiry or not market.yes_outcome:
-                continue
+        # 2. Time-decay signals (Poisson model: does market price decay fast enough?)
+        eligible = [m for m in markets if m.expiry and m.yes_outcome]
+        logger.info(
+            "  [2/3] TIME DECAY — checking %d markets with expiry and YES outcome",
+            len(eligible),
+        )
+        td_count = 0
+        for market in eligible:
             model = fit_poisson_model(market)
             if model:
                 signal = self._td_generator.generate_signal(market, model)
                 if signal:
                     all_signals.append(signal)
+                    td_count += 1
+                    logger.debug(
+                        "  [2/3] TIME DECAY signal: %s %s model=%.1f%% market=%.1f%% edge=%.1f%%",
+                        market.market_id, signal.side.value,
+                        signal.true_probability * 100,
+                        signal.implied_probability * 100,
+                        signal.edge * 100,
+                    )
+        logger.info("  [2/3] TIME DECAY — %d signals from %d eligible markets", td_count, len(eligible))
 
-        # 3. Mean-reversion signals (requires price history)
+        # 3. Mean-reversion signals (requires price history — builds up over time)
+        mr_count = 0
         for market in markets:
             if market.implied_prob_yes_mid is not None:
                 self._mr_detector.update(
@@ -365,6 +402,11 @@ class TradingOrchestrator:
             mr_signal = self._mr_detector.detect_overreaction(market, oracle_prob)
             if mr_signal:
                 all_signals.append(mr_signal)
+                mr_count += 1
+        logger.info(
+            "  [3/3] MEAN REVERSION — %d signals (needs price history; more signals appear over time)",
+            mr_count,
+        )
 
         # Sort by EV and deduplicate by market_id
         seen_markets = set()
@@ -375,6 +417,12 @@ class TradingOrchestrator:
                 unique_signals.append(s)
 
         self.latest_signals = unique_signals[:20]
+
+        actionable = [s for s in unique_signals if s.is_actionable]
+        logger.info(
+            "SIGNAL SCAN COMPLETE — %d total signals, %d actionable, executing now",
+            len(unique_signals), len(actionable),
+        )
 
         for signal in unique_signals:
             await self._db.log_signal(signal)
@@ -397,14 +445,17 @@ class TradingOrchestrator:
                         signal = signal.model_copy(update={
                             "recommended_size_usd": signal.recommended_size_usd * scale,
                         })
+                        logger.info(
+                            "  Drawdown %.1f%% — scaling %s size to $%.2f",
+                            dd * 100, signal.market_id[:20], signal.recommended_size_usd,
+                        )
+                    logger.info(
+                        "  EXECUTE %s [%s] %s size=$%.2f edge=%.1f%% EV=$%.2f",
+                        signal.alpha_type.value, signal.market_id[:24],
+                        signal.side.value, signal.recommended_size_usd,
+                        signal.edge * 100, signal.expected_value_usd,
+                    )
                     await self._router.execute_signal(signal, market)
-
-        if all_signals:
-            logger.info(
-                "Signal scan: %d total, %d actionable",
-                len(all_signals),
-                sum(1 for s in all_signals if s.is_actionable),
-            )
 
     async def _run_ofi_scan(self) -> None:
         """
@@ -425,6 +476,11 @@ class TradingOrchestrator:
             reverse=True,
         )[:30]
 
+        logger.info(
+            "OFI SCAN — watching trade flow on top %d Polymarket markets by volume",
+            len(poly_markets),
+        )
+
         nav = self._portfolio.nav
         ofi_signals = await self._ofi_analyzer.scan_universe(
             self._http_session, poly_markets, bankroll_usd=nav
@@ -432,9 +488,11 @@ class TradingOrchestrator:
 
         # Merge into latest_signals (OFI signals supplement, not replace)
         existing_ids = {s.market_id for s in self.latest_signals}
+        new_count = 0
         for sig in ofi_signals:
             if sig.market_id not in existing_ids:
                 self.latest_signals.append(sig)
+                new_count += 1
                 self._calibration.record_prediction(
                     signal_id=sig.signal_id,
                     market_id=sig.market_id,
@@ -450,8 +508,10 @@ class TradingOrchestrator:
             reverse=True,
         )[:20]
 
-        if ofi_signals:
-            logger.info("OFI scan: %d new signals", len(ofi_signals))
+        logger.info(
+            "OFI SCAN — %d new signals from %d markets (looks for large buy/sell imbalances)",
+            new_count, len(poly_markets),
+        )
 
     async def _run_near_expiry_scan(self) -> None:
         """
