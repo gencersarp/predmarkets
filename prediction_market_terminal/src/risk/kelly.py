@@ -102,6 +102,39 @@ def kelly_position_size_usd(
     return max(0.0, size)
 
 
+def min_true_probability(
+    market_price: float,
+    taker_fee: float = 0.0,
+    kelly_fraction_threshold: float = 0.0,
+) -> float:
+    """
+    Minimum true win probability required to have a Kelly fraction above
+    `kelly_fraction_threshold` at `market_price` after fees.
+
+    Derived by inverting the Kelly formula:
+        f* = (b*p - q) / b  where b = (1-price)/price
+        f* > threshold  →  p > (threshold + price) / (1 + threshold)
+
+    When taker_fee > 0, the effective payout is reduced:
+        b_eff = ((1 - taker_fee) / price) - 1
+
+    Useful for pre-filtering markets: skip any bet whose probability
+    estimate falls below this floor.
+    """
+    if market_price <= 0 or market_price >= 1:
+        return 1.0
+
+    b_eff = ((1.0 - taker_fee) / market_price) - 1.0
+    if b_eff <= 0:
+        return 1.0
+
+    # Solve f* = threshold for p: p = (threshold * (b_eff + 1) + 1) / (b_eff + 1 + threshold * (b_eff + 1))
+    # Simplified: p = (threshold + (1 / (b_eff + 1)))
+    # Full derivation: b_eff*p - (1-p) = threshold * b_eff  →  p*(b_eff+1) = threshold*b_eff + 1
+    p_min = (kelly_fraction_threshold * b_eff + 1.0) / (b_eff + 1.0)
+    return min(max(p_min, 0.0), 1.0)
+
+
 def portfolio_kelly_adjustment(
     base_kelly: float,
     existing_correlated_exposure: float,   # USD already in correlated bets
