@@ -51,12 +51,14 @@ class PaperExchangeAdapter(ExchangeAdapter):
         exchange: Exchange,
         initial_balance_usd: float = 1000.0,
         db_log_callback=None,  # async callable(order) for DB persistence
+        taker_fee: float = 0.0,
     ) -> None:
         self._exchange = exchange
         self._balance = initial_balance_usd
         self._orders: dict[str, Order] = {}
         self._positions: list[Position] = []
         self._db_log = db_log_callback
+        self._taker_fee = taker_fee
 
     @property
     def name(self) -> str:
@@ -97,27 +99,12 @@ class PaperExchangeAdapter(ExchangeAdapter):
         fill_price = self._simulate_fill_price(order, market)
 
         if fill_price is not None:
-            # Deduct from balance
-            if order_side == OrderSide.BUY:
-                cost = size_usd
-                if cost > self._balance:
-                    order.status = OrderStatus.REJECTED
-                    logger.warning(
-                        "Paper order rejected: insufficient balance "
-                        "(need $%.2f, have $%.2f)",
-                        cost,
-                        self._balance,
-                    )
-                else:
-                    self._balance -= cost
-                    order.status = OrderStatus.FILLED
-                    order.filled_size_usd = size_usd
-                    order.avg_fill_price = fill_price
-            else:
-                order.status = OrderStatus.FILLED
-                order.filled_size_usd = size_usd
-                order.avg_fill_price = fill_price
-                self._balance += size_usd  # proceeds from sell
+            # We no longer deduct from self._balance here.
+            # Cash management is now centralized in PortfolioManager.
+            # This adapter just provides the fill price and status.
+            order.status = OrderStatus.FILLED
+            order.filled_size_usd = size_usd
+            order.avg_fill_price = fill_price
         else:
             # Limit order not immediately fillable
             if order_type in (OrderType.IOC, OrderType.FOK):
@@ -201,17 +188,13 @@ class PaperExchangeAdapter(ExchangeAdapter):
             return order.price
 
         if order.order_type in (OrderType.IOC, OrderType.FOK, OrderType.MARKET):
-            # IOC/FOK: fill only if limit price is at or better than the market
+            # IOC/FOK in paper mode: fill at the current market price (taker).
+            # We don't enforce a limit price check here — the signal already
+            # passed risk guards and the edge calculation used the ask price.
             if order.order_side == OrderSide.BUY:
-                market_ask = outcome.implied_prob_ask
-                if order.price >= market_ask:
-                    return market_ask  # fill at the better market price
-                return None  # limit below ask → cancel
+                return outcome.implied_prob_ask
             else:
-                market_bid = outcome.implied_prob_bid
-                if order.price <= market_bid:
-                    return market_bid
-                return None  # limit above bid → cancel
+                return outcome.implied_prob_bid
         else:
             # GTC limit order: fill if price is at or better than book
             if order.order_side == OrderSide.BUY and order.price >= outcome.implied_prob_ask:

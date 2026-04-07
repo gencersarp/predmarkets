@@ -176,22 +176,48 @@ class PolymarketFeed:
             except ValueError:
                 pass
 
-        # Outcomes
+        # Outcomes — Gamma bulk API returns outcomePrices/outcomes as JSON strings;
+        # individual fetches may return a tokens array. Support both formats.
         outcomes: list[MarketOutcome] = []
         tokens = raw.get("tokens", [])
-        for token in tokens:
-            side = Side.YES if token.get("outcome", "").lower() == "yes" else Side.NO
-            # Prices come as floats 0-1 from Gamma
-            price = float(token.get("price", 0.5))
-            outcomes.append(
-                MarketOutcome(
-                    outcome_id=str(token.get("token_id", f"{market_id}_{side.value}")),
-                    side=side,
-                    implied_prob_bid=max(0.0, price - 0.01),
-                    implied_prob_ask=min(1.0, price + 0.01),
-                    amm_token_address=token.get("token_id"),
+        if tokens:
+            for token in tokens:
+                side = Side.YES if token.get("outcome", "").lower() == "yes" else Side.NO
+                price = float(token.get("price", 0.5))
+                vol = float(token.get("volume", 0.0))
+                outcomes.append(
+                    MarketOutcome(
+                        outcome_id=str(token.get("token_id", f"{market_id}_{side.value}")),
+                        side=side,
+                        implied_prob_bid=max(0.0, price - 0.01),
+                        implied_prob_ask=min(1.0, price + 0.01),
+                        volume_24h=vol,
+                        amm_token_address=token.get("token_id"),
+                    )
                 )
-            )
+        else:
+            # Bulk gamma response: parse outcomePrices / outcomes JSON strings
+            import json as _json
+            raw_prices = raw.get("outcomePrices") or raw.get("outcome_prices", "")
+            raw_names = raw.get("outcomes", "")
+            try:
+                prices = _json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+                names = _json.loads(raw_names) if isinstance(raw_names, str) else (raw_names or [])
+            except Exception:
+                prices, names = [], []
+            vol_24h = float(raw.get("volume24hr") or raw.get("volume_24hr") or 0.0)
+            for i, name in enumerate(names):
+                side = Side.YES if str(name).lower() == "yes" else Side.NO
+                price = float(prices[i]) if i < len(prices) else 0.5
+                outcomes.append(
+                    MarketOutcome(
+                        outcome_id=f"{market_id}_{side.value}",
+                        side=side,
+                        implied_prob_bid=max(0.0, price - 0.01),
+                        implied_prob_ask=min(1.0, price + 0.01),
+                        volume_24h=vol_24h if side == Side.YES else 0.0,
+                    )
+                )
 
         # Resolution source heuristic
         res_source = ResolutionSource.UMA_ORACLE
@@ -252,17 +278,26 @@ class PolymarketFeed:
         """
         Maintain a persistent WebSocket connection to the CLOB.
         On disconnect, exponentially back off and reconnect.
+        After 5 consecutive failures, give up and fall back to REST polling.
         """
         backoff = 1.0
+        consecutive_failures = 0
+        max_failures = 5
+        _ever_connected = False
+
         while self._running:
+            connect_time = time.monotonic()
             try:
                 async with websockets.connect(
                     _WS_ENDPOINT + "market",
                     ping_interval=30,
                     ping_timeout=10,
                 ) as ws:
-                    backoff = 1.0  # reset on successful connect
-                    logger.info("Polymarket WS connected")
+                    if not _ever_connected:
+                        logger.info("Polymarket WS connected")
+                        _ever_connected = True
+                    else:
+                        logger.debug("Polymarket WS reconnected")
 
                     # Subscribe to all tracked markets
                     if self._markets:
@@ -283,9 +318,23 @@ class PolymarketFeed:
                             logger.debug("WS parse error: %s", exc)
 
             except (websockets.ConnectionClosed, OSError) as exc:
-                logger.warning("Polymarket WS disconnected: %s. Retrying in %ss", exc, backoff)
+                session_duration = time.monotonic() - connect_time
+                if session_duration > 5.0:
+                    # Connection lasted a while — real disconnect, reset counter
+                    backoff = 1.0
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.warning(
+                        "Polymarket WS failed %d times in a row — switching to REST-only polling. "
+                        "Prices refresh every 60s.", consecutive_failures
+                    )
+                    return  # Exit the listener; REST polling continues in the background
+                logger.debug("Polymarket WS disconnected: %s. Retry %d/%d in %ss",
+                             exc, consecutive_failures, max_failures, backoff)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                backoff = min(backoff * 2, 30)
 
     def _process_ws_message(self, msg: dict[str, Any]) -> None:
         """Update cached market from WebSocket tick."""

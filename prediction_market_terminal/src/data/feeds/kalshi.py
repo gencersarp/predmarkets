@@ -289,7 +289,8 @@ class KalshiFeed:
 
         # Expiry
         expiry: Optional[datetime] = None
-        for field in ("close_time", "expiration_time", "expected_expiration_ts"):
+        for field in ("close_time", "expiration_time", "expected_expiration_time",
+                      "expected_expiration_ts", "end_date_iso", "close_date"):
             val = raw.get(field)
             if val:
                 try:

@@ -88,6 +88,17 @@ class OrderRouter:
             signal.edge * 100, signal.recommended_size_usd,
         )
 
+        # Check for existing position in same market (avoid duplicate bets)
+        if self._portfolio.has_position_in_market(market.market_id):
+            existing = self._portfolio.get_position_for_market(market.market_id)
+            if existing and existing.side == signal.side:
+                logger.debug(
+                    "  SKIPPED — already holding %s %s in %s ($%.2f)",
+                    existing.side.value, market.exchange.value,
+                    market.market_id[:24], existing.size_usd,
+                )
+                return None
+
         try:
             self._guards.run_directional(
                 signal=signal,
@@ -101,9 +112,23 @@ class OrderRouter:
             logger.warning("  BLOCKED — %s", exc)
             return None
 
-        logger.info("  PASSED all risk guards — placing order")
         adapter = self._adapter_for(market.exchange)
         order_type = OrderType(self._settings.default_order_type.value.lower())
+
+        # Cap size to available balance — never attempt to spend more than we have.
+        # Reserve enough for exchange fees (Kalshi=7%, Poly=2%) to avoid rejections.
+        available = await adapter.get_balance_usd()
+        fee_rate = market.taker_fee if market.taker_fee > 0 else 0.02
+        available_after_fees = available / (1.0 + fee_rate) * 0.95
+        size_usd = min(signal.recommended_size_usd, available_after_fees)
+        if size_usd < 1.0:
+            logger.warning("  SKIPPED — insufficient balance ($%.2f available)", available)
+            return None
+
+        logger.info(
+            "  PASSED all risk guards — placing order (balance=$%.2f, size=$%.2f)",
+            available, size_usd,
+        )
 
         order = await adapter.place_order(
             market_id=market.market_id,
@@ -111,7 +136,7 @@ class OrderRouter:
             order_side=OrderSide.BUY,
             order_type=order_type,
             price=signal.implied_probability,
-            size_usd=signal.recommended_size_usd,
+            size_usd=size_usd,
             is_paper=not is_live,
             market=market,
         )
@@ -159,7 +184,7 @@ class OrderRouter:
                 is_live_order=is_live,
             )
         except Exception as exc:
-            logger.warning("Arb blocked by risk guard: %s", exc)
+            logger.debug("Arb blocked by risk guard: %s", exc)
             return []
 
         filled_orders: list[Order] = []
@@ -234,4 +259,9 @@ class OrderRouter:
         # For order book markets, estimate slippage from spread
         if yes and yes.order_book and yes.order_book.spread:
             return yes.order_book.spread / 2
-        return 0.0
+        # For markets without explicit order book, estimate from bid-ask
+        if yes:
+            spread = yes.implied_prob_ask - yes.implied_prob_bid
+            if spread > 0:
+                return spread / 2
+        return 0.005  # Conservative default 0.5% slippage

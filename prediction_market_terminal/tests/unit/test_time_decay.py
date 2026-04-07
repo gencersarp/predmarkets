@@ -29,7 +29,7 @@ class TestPoissonDecayModel:
     def test_probability_decreases_with_fewer_days(self):
         now = datetime.now(timezone.utc)
         model = PoissonDecayModel(
-            lambda_rate=0.5,
+            lambda_rate=0.15,
             reference_time=now,
             resolution_time=now + timedelta(days=14),
         )
@@ -66,7 +66,7 @@ class TestPoissonDecayModel:
         assert abs(hl - math.log(2) / lam) < 1e-6
 
     def test_expected_decay_positive(self):
-        model = self._make_model(lambda_rate=0.5, days_remaining=10.0)
+        model = self._make_model(lambda_rate=0.10, days_remaining=10.0)
         decay = model.expected_decay_over(days=3.0)
         assert decay > 0  # probability decreases as time passes
 
@@ -77,18 +77,18 @@ class TestPoissonDecayModel:
         assert model_high.true_probability_at() > model_low.true_probability_at()
 
     def test_poisson_formula_correctness(self):
-        """P = 1 - exp(-λ*T)"""
-        lam = 0.5
-        T = 10.0
+        """P = min(0.85, 1 - exp(-λ*T))  (capped at 0.85 for model uncertainty)"""
+        lam = 0.1
+        T = 5.0
         now = datetime.now(timezone.utc)
         model = PoissonDecayModel(
             lambda_rate=lam,
             reference_time=now,
             resolution_time=now + timedelta(days=T),
         )
-        expected = 1.0 - math.exp(-lam * T)
+        raw = 1.0 - math.exp(-lam * T)  # ~0.394 — safely below cap
         actual = model.true_probability_at(now)
-        assert abs(actual - expected) < 0.01  # allow 1% tolerance for clipping
+        assert abs(actual - raw) < 0.01
 
 
 class TestFitPoissonModel:
@@ -195,9 +195,9 @@ class TestStepFunctionProbability:
 
 
 class TestLambdaEstimates:
-    def test_all_lambdas_positive(self):
+    def test_all_lambdas_positive_or_none(self):
         for name, lam in LAMBDA_ESTIMATES.items():
-            assert lam > 0, f"Lambda for {name} should be positive"
+            assert lam is None or lam > 0, f"Lambda for {name} should be positive or None"
 
     def test_fed_meeting_rate_reasonable(self):
         # Fed meets every ~45 days

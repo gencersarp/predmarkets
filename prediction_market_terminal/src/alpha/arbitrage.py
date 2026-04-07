@@ -167,8 +167,10 @@ class ResolutionRiskAssessor:
         risk = 0.0
 
         # Different resolution mechanisms
+        # This is expected for cross-exchange arbs — Polymarket uses UMA,
+        # Kalshi resolves internally. The risk is real but manageable.
         if market_a.resolution_source != market_b.resolution_source:
-            risk += 0.4
+            risk += 0.15
             flags.append(
                 f"Different resolution sources: "
                 f"{market_a.resolution_source.value} vs "
@@ -181,30 +183,32 @@ class ResolutionRiskAssessor:
             or market_b.resolution_source == ResolutionSource.UMA_ORACLE
         )
         if uma_involved:
-            risk += 0.2
+            risk += 0.10
             flags.append("UMA dispute period risk: capital locked up to 48h post-event")
 
         # Compare resolution criteria text similarity
+        # Cross-exchange criteria are often written very differently even for
+        # identical events, so only penalise heavily for near-zero similarity.
         sim = SequenceMatcher(
             None,
             market_a.resolution_criteria.lower(),
             market_b.resolution_criteria.lower(),
         ).ratio()
-        if sim < 0.5:
-            risk += 0.3
+        if sim < 0.2:
+            risk += 0.20
             flags.append(
-                f"Low resolution criteria similarity ({sim:.0%}): "
+                f"Very low resolution criteria similarity ({sim:.0%}): "
                 "markets may resolve differently on identical outcomes"
             )
-        elif sim < 0.8:
-            risk += 0.1
-            flags.append(f"Moderate criteria similarity ({sim:.0%}): verify resolution rules")
+        elif sim < 0.5:
+            risk += 0.10
+            flags.append(f"Low criteria similarity ({sim:.0%}): verify resolution rules")
 
         # Different expiry dates → temporal mismatch
         if market_a.expiry and market_b.expiry:
             diff_days = abs((market_a.expiry - market_b.expiry).total_seconds()) / 86400
             if diff_days > 7:
-                risk += 0.2
+                risk += 0.20
                 flags.append(
                     f"Expiry mismatch: {diff_days:.0f} days apart — "
                     "positions may not resolve simultaneously"
@@ -329,7 +333,7 @@ def detect_intra_market_arb(
 def detect_complement_arb(
     market_a: Market,
     market_b: Market,
-    min_keyword_overlap: float = 0.25,
+    min_keyword_overlap: float = 0.50,
     max_capital_usd: float = 300.0,
 ) -> Optional[ArbitrageOpportunity]:
     """
@@ -376,6 +380,13 @@ def detect_complement_arb(
 
     if cost >= 1.0:
         return None  # No complement arb
+
+    # Require each side to have a non-trivial probability.
+    # If asks are both tiny (e.g. 0.02 + 0.03 = 0.05), these are just two
+    # unrelated low-probability events — NOT a complement pair.
+    # Real complement pairs: "Trump wins" (50%) + "Harris wins" (45%) = 95¢
+    if cost < 0.60:
+        return None  # Not a genuine complement pair
 
     gross_edge = 1.0 - cost
 
@@ -522,10 +533,15 @@ class CrossExchangeArbDetector:
             return None
 
         # Title similarity: combined token-overlap + SequenceMatcher
-        # Token overlap handles cross-exchange naming differences better
         sim = _title_match_score(market_a.title, market_b.title)
         if sim < min_similarity:
             return None
+
+        # Expiry proximity: same event should resolve within 7 days of each other
+        if market_a.expiry and market_b.expiry:
+            expiry_gap_days = abs((market_a.expiry - market_b.expiry).total_seconds()) / 86400
+            if expiry_gap_days > 7:
+                return None
 
         yes_a = market_a.yes_outcome
         yes_b = market_b.yes_outcome
@@ -567,8 +583,8 @@ class CrossExchangeArbDetector:
             if m.exchange == Exchange.POLYMARKET
         )
 
-        # Optimal position size
-        capital = min(max_capital_usd, 200.0)
+        # Optimal position size — cap to max_single_position_usd from settings
+        capital = min(max_capital_usd, get_settings().max_single_position_usd)
         fee_cost = capital * (fee_rate_yes + fee_rate_no) / 2
         net_edge_pct = gross_edge - (fee_cost / capital) - (gas / capital)
         net_edge_usd = capital * net_edge_pct
@@ -638,7 +654,7 @@ class CrossExchangeArbDetector:
     def scan_universe(
         self,
         all_markets: list[Market],
-        min_similarity: float = 0.35,
+        min_similarity: float = 0.40,
     ) -> list[ArbitrageOpportunity]:
         """
         O(n²) scan of market universe for cross-exchange arb.
@@ -677,7 +693,7 @@ class CrossExchangeArbDetector:
                 if comp_opp:
                     opps.append(comp_opp)
 
-        logger.info(
+        logger.debug(
             "Cross-exchange scan: %d poly × %d kalshi = %d opportunities",
             len(poly_markets), len(kalshi_markets), len(opps),
         )
@@ -804,7 +820,7 @@ class ArbitrageScanner:
         # (caller must pass pre-identified triplets)
 
         actionable = [o for o in opportunities if o.is_actionable]
-        logger.info(
+        logger.debug(
             "Arb scan: %d total opportunities, %d actionable",
             len(opportunities), len(actionable),
         )

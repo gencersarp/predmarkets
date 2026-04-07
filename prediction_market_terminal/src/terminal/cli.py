@@ -54,16 +54,19 @@ async def _run_terminal(dashboard: bool) -> None:
     from src.terminal.orchestrator import TradingOrchestrator
     orchestrator = TradingOrchestrator()
 
-    if dashboard:
-        from src.terminal.dashboard import run_dashboard
-        # Run orchestrator and dashboard concurrently
-        await asyncio.gather(
-            orchestrator.start(),
-            run_dashboard(orchestrator),
-            return_exceptions=True,
-        )
-    else:
-        await orchestrator.start()
+    try:
+        if dashboard:
+            from src.terminal.dashboard import run_dashboard
+            # Run orchestrator and dashboard concurrently
+            await asyncio.gather(
+                orchestrator.start(),
+                run_dashboard(orchestrator),
+                return_exceptions=True,
+            )
+        else:
+            await orchestrator.start()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
 
 
 @main.command()

@@ -108,14 +108,14 @@ class TestGuardProbabilityBounds:
 
     def test_near_zero_raises(self):
         with pytest.raises(RiskLimitBreached):
-            guard_probability_bounds(0.01)  # below 0.03 floor
+            guard_probability_bounds(0.005)  # below 0.01 floor
 
     def test_near_one_raises(self):
         with pytest.raises(RiskLimitBreached):
             guard_probability_bounds(0.98)  # above 0.97 ceiling
 
     def test_boundary_values_pass(self):
-        assert guard_probability_bounds(0.03).passed
+        assert guard_probability_bounds(0.01).passed
         assert guard_probability_bounds(0.97).passed
 
 

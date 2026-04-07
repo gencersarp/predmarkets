@@ -200,7 +200,7 @@ class ArbitrageOpportunity(BaseModel):
     """A detected arbitrage opportunity."""
     opp_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     alpha_type: AlphaType
-    detected_at: datetime = Field(default_factory=datetime.utcnow)
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     # Markets involved
     market_ids: list[str]
@@ -240,7 +240,7 @@ class DirectionalSignal(BaseModel):
     """A fundamental / directional alpha signal."""
     signal_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     alpha_type: AlphaType
-    detected_at: datetime = Field(default_factory=datetime.utcnow)
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     market_id: str
     exchange: Exchange
@@ -270,7 +270,7 @@ class DirectionalSignal(BaseModel):
     def is_actionable(self) -> bool:
         return (
             self.expected_value_usd > 0
-            and self.edge >= 0.03
+            and self.edge >= 0.02
             and RiskFlag.FEE_EXCESSIVE not in self.risk_flags
             and RiskFlag.AROC_BELOW_MIN not in self.risk_flags
         )
@@ -292,8 +292,8 @@ class Order(BaseModel):
     status: OrderStatus = OrderStatus.PENDING
     filled_size_usd: float = 0.0
     avg_fill_price: Optional[float] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     exchange_order_id: Optional[str] = None
     is_paper: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -311,7 +311,7 @@ class Position(BaseModel):
     unrealised_pnl: float = 0.0
     status: PositionStatus = PositionStatus.OPEN
     expiry: Optional[datetime] = None
-    opened_at: datetime = Field(default_factory=datetime.utcnow)
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     resolved_at: Optional[datetime] = None
     is_paper: bool = True
     signal_id: Optional[str] = None
@@ -334,7 +334,7 @@ class Position(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PortfolioSnapshot(BaseModel):
-    snapshot_at: datetime = Field(default_factory=datetime.utcnow)
+    snapshot_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     total_nav_usd: float
     available_capital_usd: float
     locked_capital_usd: float

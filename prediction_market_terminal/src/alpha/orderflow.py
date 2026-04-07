@@ -137,10 +137,8 @@ class OrderFlowAnalyzer:
             return None
 
         # Adjust true_probability toward signal direction
-        if signal_side == Side.YES:
-            true_prob = min(0.97, trade_price + raw_edge)
-        else:
-            true_prob = min(0.97, trade_price + raw_edge)
+        # For both sides: OFI suggests true prob is higher than market ask
+        true_prob = min(0.97, max(0.03, trade_price + raw_edge))
 
         # Kelly sizing (conservative — OFI signals are short-term)
         from src.risk.kelly import kelly_fraction
@@ -207,7 +205,7 @@ class OrderFlowAnalyzer:
                     signals.append(sig)
             except Exception as exc:
                 logger.debug("OFI scan failed for %s: %s", market.market_id[:16], exc)
-        logger.info(
+        logger.debug(
             "OFI scan: %d markets → %d actionable signals",
             len(markets), len(signals),
         )

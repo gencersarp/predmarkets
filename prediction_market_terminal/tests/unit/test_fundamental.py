@@ -202,5 +202,5 @@ class TestDirectionalSignalIsActionable:
 
     def test_not_actionable_with_low_edge(self):
         from tests.conftest import make_directional_signal
-        sig = make_directional_signal(edge=0.02)  # below 0.03 threshold
+        sig = make_directional_signal(edge=0.015)  # below 0.02 threshold
         assert not sig.is_actionable

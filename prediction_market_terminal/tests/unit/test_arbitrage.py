@@ -183,7 +183,7 @@ class TestResolutionRiskAssessor:
         assessor = ResolutionRiskAssessor()
         result = assessor.assess(poly, kalshi)
         assert result.flagged
-        assert result.risk_level > 0.3
+        assert result.risk_level > 0.2
 
     def test_expiry_mismatch_adds_risk(self):
         m1 = make_market(expiry_days=5.0)

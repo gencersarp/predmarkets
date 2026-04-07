@@ -229,6 +229,23 @@ def guard_aroc(aroc_annual: float) -> GuardResult:
 # Composite Guard Runner
 # ---------------------------------------------------------------------------
 
+def guard_spread(market: Market, max_spread_pct: float = 0.10) -> GuardResult:
+    """Block trades in markets with wide spreads (relative to price)."""
+    yes = market.yes_outcome
+    if not yes or yes.implied_prob_ask == 0:
+        return GuardResult(passed=True, guard_name="spread")
+    
+    spread = yes.implied_prob_ask - yes.implied_prob_bid
+    spread_pct = spread / yes.implied_prob_ask
+    
+    if spread_pct > max_spread_pct:
+        raise RiskLimitBreached(
+            limit_name="max_spread",
+            current=spread_pct,
+            limit=max_spread_pct,
+        )
+    return GuardResult(passed=True, guard_name="spread", reason=f"spread={spread_pct:.1%}")
+
 class RiskGuardRunner:
     """
     Runs all applicable guards for a given trade action.
@@ -259,20 +276,20 @@ class RiskGuardRunner:
             lambda: guard_probability_bounds(signal.implied_probability),
             lambda: guard_correlation(market, signal.recommended_size_usd, portfolio),
             lambda: guard_aroc(signal.aroc_annual),
+            lambda: guard_liquidity(vol_24h), # Enable for PAPER too
+            lambda: guard_spread(market),     # New spread guard
         ]
-        # Liquidity guard only applies in live mode — paper trading doesn't move markets
-        if is_live_order:
-            guards_to_run.append(lambda: guard_liquidity(vol_24h))
 
         if market.exchange == Exchange.POLYMARKET:
             guards_to_run.append(lambda: guard_gas_price(current_gas_gwei))
             guards_to_run.append(lambda: guard_slippage(expected_slippage))
 
         fee_cost = signal.recommended_size_usd * market.taker_fee
+        # Gross edge in USD = edge_pct * position_size (before fees).
+        # Use this — NOT EV — as the denominator for fee consumption.
+        gross_edge_usd = signal.edge * signal.recommended_size_usd
         guards_to_run.append(
-            lambda: guard_fee_consumption(
-                signal.expected_value_usd + fee_cost, fee_cost
-            )
+            lambda: guard_fee_consumption(gross_edge_usd, fee_cost)
         )
 
         for guard_fn in guards_to_run:
@@ -307,10 +324,12 @@ class RiskGuardRunner:
 
         for market in markets:
             results.append(guard_stale_data(market))
+            results.append(guard_spread(market)) # New spread guard
+            
             yes = market.yes_outcome
-            # Liquidity guard only in live mode — paper trades don't move markets
-            if is_live_order and yes:
-                results.append(guard_liquidity(yes.volume_24h))
+            vol_24h = yes.volume_24h if yes else 0.0
+            results.append(guard_liquidity(vol_24h)) # Enable for PAPER too
+            
             if market.exchange == Exchange.POLYMARKET:
                 results.append(guard_gas_price(current_gas_gwei))
 

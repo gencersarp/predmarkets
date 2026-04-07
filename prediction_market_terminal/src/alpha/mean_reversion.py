@@ -178,8 +178,8 @@ class MeanReversionDetector:
 
     def __init__(
         self,
-        spike_threshold: float = 0.10,         # price move > 10% in 30min = spike
-        volume_decay_threshold: float = 0.30,   # volume falls to <30% of peak
+        spike_threshold: float = 0.06,         # price move > 6% in 30min = spike
+        volume_decay_threshold: float = 0.40,   # volume falls to <40% of peak
         min_edge: float = 0.04,
     ) -> None:
         self._spike_threshold = spike_threshold
@@ -251,16 +251,26 @@ class MeanReversionDetector:
         if fair_value is None:
             return None
 
+        # Anchor fair value toward current price to avoid nonsensical edges.
+        # MR model has strong statistical backing when spike + volume decay
+        # are confirmed — trust it heavily to preserve the edge.
+        fair_value = 0.70 * fair_value + 0.30 * current
+
         # 4. Edge calculation
         edge = fair_value - current   # positive = current price is below fair value
 
         if abs(edge) < self._min_edge:
             return None
 
-        # 5. Only fade if volume is decaying (confirmation of overreaction subsiding)
-        if not volume_decaying and abs(price_move) < 0.20:
+        # Cap edge at 15% — larger edges are model errors, not real alpha.
+        if abs(edge) > 0.15:
+            return None
+
+        # 5. REQUIRE volume decay confirmation before fading.
+        # Without decay, the move may be fundamental (new information), not an overreaction.
+        if not volume_decaying:
             logger.debug(
-                "Spike detected for %s (move=%.2f) but volume not yet decaying",
+                "Spike detected for %s (move=%.2f) but volume not yet decaying — skipping",
                 market_id, price_move,
             )
             return None

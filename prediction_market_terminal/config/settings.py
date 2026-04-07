@@ -85,12 +85,12 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------------ Risk
     max_portfolio_exposure_usd: float = 1000.0
-    max_single_position_usd: float = 150.0
+    max_single_position_usd: float = 75.0
     kelly_fraction: float = Field(0.25, ge=0.01, le=1.0)
-    max_drawdown_pct: float = Field(0.20, ge=0.01, le=1.0)
+    max_drawdown_pct: float = Field(0.35, ge=0.01, le=1.0)
     max_correlation_exposure: float = Field(0.40, ge=0.0, le=1.0)
     aroc_minimum_annual: float = Field(0.30, ge=0.0)
-    fee_edge_max_consumption: float = Field(0.40, ge=0.0, le=1.0)
+    fee_edge_max_consumption: float = Field(0.30, ge=0.0, le=1.0)
 
     # ------------------------------------------------------------------ Execution
     default_order_type: OrderType = OrderType.IOC

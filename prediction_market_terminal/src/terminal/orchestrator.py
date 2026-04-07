@@ -21,7 +21,7 @@ import asyncio
 import logging
 import signal
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
@@ -33,13 +33,20 @@ from src.alpha.fundamental import EVEngine
 from src.alpha.mean_reversion import MeanReversionDetector
 from src.alpha.orderflow import OrderFlowAnalyzer
 from src.alpha.time_decay import TimeDecaySignalGenerator, fit_poisson_model
-from src.core.constants import NEAR_EXPIRY_HOURS, NEAR_EXPIRY_SCAN_INTERVAL_SEC
+from src.core.constants import (
+    MARKET_TITLE_BLACKLIST_PATTERNS,
+    NEAR_EXPIRY_HOURS,
+    NEAR_EXPIRY_SCAN_INTERVAL_SEC,
+    POSITION_STOP_LOSS_PCT,
+)
 from src.core.models import (
     ArbitrageOpportunity,
     DirectionalSignal,
     Exchange,
     Market,
     OracleEstimate,
+    RiskFlag,
+    Side,
 )
 from src.data.feeds.kalshi import KalshiFeed
 from src.data.feeds.oracles import OracleFeed
@@ -94,11 +101,13 @@ class TradingOrchestrator:
             exchange=Exchange.POLYMARKET,
             initial_balance_usd=self._settings.paper_initial_balance_usd / 2,
             db_log_callback=self._db.log_paper_order,
+            taker_fee=0.02,
         )
         self._kalshi_adapter = PaperExchangeAdapter(
             exchange=Exchange.KALSHI,
             initial_balance_usd=self._settings.paper_initial_balance_usd / 2,
             db_log_callback=self._db.log_paper_order,
+            taker_fee=0.07,
         )
 
         if self._settings.is_live:
@@ -120,8 +129,8 @@ class TradingOrchestrator:
         # Strategy engines
         self._arb_scanner = ArbitrageScanner()
         self._ev_engine = EVEngine(min_edge_pct=0.05)
-        self._mr_detector = MeanReversionDetector()
-        self._td_generator = TimeDecaySignalGenerator(min_edge=0.04)
+        self._mr_detector = MeanReversionDetector(min_edge=0.03)
+        self._td_generator = TimeDecaySignalGenerator(min_edge=0.03)
         self._ofi_analyzer = OrderFlowAnalyzer()
         self._calibration = get_calibration_tracker()
 
@@ -136,11 +145,32 @@ class TradingOrchestrator:
         self._last_market_refresh: float = 0.0
         self._last_oracle_refresh: float = 0.0
         self._last_mtm: float = 0.0
+        self._last_status_log: float = 0.0
 
         # Live signals / opportunities (for dashboard consumption)
         self.latest_arb_opportunities: list[ArbitrageOpportunity] = []
         self.latest_signals: list[DirectionalSignal] = []
 
+        # Execution log for dashboard (last N actions with reasons)
+        self.execution_log: list[dict] = []  # [{time, action, market, detail, result}]
+        self._max_exec_log = 50
+
+        # Strategy P&L tracking by alpha_type
+        self.strategy_stats: dict[str, dict] = {}  # alpha_type -> {trades, wins, pnl}
+
+        # Scan counters (for dashboard info)
+        self.scan_counts: dict[str, int] = {
+            "arb_scans": 0, "arb_found": 0,
+            "signal_scans": 0, "signals_found": 0, "signals_executed": 0,
+            "ofi_scans": 0, "ofi_found": 0,
+            "markets_filtered": 0,
+        }
+
+        self._start_time: float = 0.0
+        self._total_orders_placed: int = 0
+        self._total_orders_filled: int = 0
+        self._rejected_cooldown: dict[str, float] = {}  # market_id -> cooldown_until
+        self._closed_at_loss_cooldown: dict[str, float] = {}  # market_id -> cooldown_until
         self._running = False
 
     # ---------------------------------------------------------------- Lifecycle
@@ -174,6 +204,7 @@ class TradingOrchestrator:
                 )
 
         self._running = True
+        self._start_time = time.time()
 
         # Initial market refresh
         await self._refresh_markets()
@@ -190,11 +221,14 @@ class TradingOrchestrator:
 
         try:
             await self._main_loop()
+        except asyncio.CancelledError:
+            pass
         finally:
             await self.stop()
 
     async def stop(self) -> None:
         self._running = False
+        self._print_shutdown_report()
         logger.info("Stopping terminal...")
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
@@ -204,9 +238,112 @@ class TradingOrchestrator:
         await self._db.close()
         logger.info("Terminal stopped")
 
+    def _print_shutdown_report(self) -> None:
+        """Print a final summary report on shutdown."""
+        elapsed = time.time() - self._start_time if self._start_time else 0
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        snap = self._portfolio.compute_snapshot()
+        positions = snap.positions
+        initial_nav = self._settings.paper_initial_balance_usd
+
+        total_return = snap.total_nav_usd - initial_nav
+        total_return_pct = (total_return / initial_nav) * 100 if initial_nav else 0
+
+        report_lines = [
+            "",
+            "=" * 65,
+            "  PREDICTION MARKET TERMINAL — SHUTDOWN REPORT",
+            "=" * 65,
+            f"  Mode:     {self._settings.pmt_mode.value.upper()}",
+            f"  Runtime:  {hours}h {minutes}m {seconds}s",
+            f"  Started:  {datetime.fromtimestamp(self._start_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if self._start_time else 'N/A'}",
+            "",
+            "  --- Portfolio ---",
+            f"  Initial NAV:    ${initial_nav:>10.2f}",
+            f"  Final NAV:      ${snap.total_nav_usd:>10.2f}",
+            f"  Total Return:   ${total_return:>10.2f}  ({total_return_pct:+.2f}%)",
+            f"  Unrealised PnL: ${snap.unrealised_pnl_usd:>10.2f}",
+            f"  Realised PnL:   ${snap.realised_pnl_usd:>10.2f}",
+            f"  Peak NAV:       ${snap.peak_nav_usd:>10.2f}",
+            f"  Max Drawdown:   {snap.current_drawdown_pct * 100:>9.1f}%",
+            f"  Cash Available: ${snap.available_capital_usd:>10.2f}",
+            "",
+            "  --- Scanning ---",
+            f"  Arb scans:        {self.scan_counts['arb_scans']:>6}",
+            f"  Arb found:        {self.scan_counts['arb_found']:>6}",
+            f"  Signal scans:     {self.scan_counts['signal_scans']:>6}",
+            f"  Signals found:    {self.scan_counts['signals_found']:>6}",
+            f"  Signals executed: {self.scan_counts['signals_executed']:>6}",
+            f"  OFI scans:        {self.scan_counts['ofi_scans']:>6}",
+            f"  OFI found:        {self.scan_counts['ofi_found']:>6}",
+            f"  Markets filtered: {self.scan_counts['markets_filtered']:>6}",
+        ]
+
+        if positions:
+            report_lines.append("")
+            report_lines.append(f"  --- Open Positions ({len(positions)}) ---")
+            for p in positions:
+                pnl_sign = "+" if p.unrealised_pnl >= 0 else ""
+                report_lines.append(
+                    f"  {p.side.value.upper():<3} {p.market_title[:40]:<40} "
+                    f"${p.size_usd:<7.0f} @{p.entry_price:.2f}->{p.current_price:.2f} "
+                    f"{pnl_sign}${p.unrealised_pnl:.2f}"
+                )
+
+        if self.execution_log:
+            report_lines.append("")
+            report_lines.append(f"  --- Recent Trades (last {min(10, len(self.execution_log))}) ---")
+            for entry in self.execution_log[-10:]:
+                report_lines.append(
+                    f"  [{entry['time']}] {entry['action']:<10} {entry['market']:<30} "
+                    f"{entry['detail']} → {entry['result']}"
+                )
+
+        report_lines.append("")
+        report_lines.append("=" * 65)
+
+        # Print directly to stdout so it always shows, even if logger is noisy
+        print("\n".join(report_lines))
+
     def _request_shutdown(self) -> None:
         logger.info("Shutdown requested")
         self._running = False
+        # Cancel all running tasks so the loop exits immediately instead of
+        # waiting for the current scan/sleep to finish naturally.
+        loop = asyncio.get_event_loop()
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    # ---------------------------------------------------------------- Helpers
+
+    def _log_execution(self, action: str, market: str, detail: str, result: str) -> None:
+        """Append to execution log for dashboard display."""
+        entry = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "action": action,
+            "market": market[:30],
+            "detail": detail,
+            "result": result,
+        }
+        self.execution_log.append(entry)
+        if len(self.execution_log) > self._max_exec_log:
+            self.execution_log = self.execution_log[-self._max_exec_log:]
+
+    @staticmethod
+    def _is_blacklisted(market: Market) -> bool:
+        """Check if a market matches blacklist patterns (test/garbage markets)."""
+        title_lower = market.title.lower()
+        return any(pat in title_lower for pat in MARKET_TITLE_BLACKLIST_PATTERNS)
+
+    def _filter_markets(self, markets: list[Market]) -> list[Market]:
+        """Filter out blacklisted/test markets."""
+        filtered = [m for m in markets if not self._is_blacklisted(m)]
+        n_removed = len(markets) - len(filtered)
+        if n_removed:
+            self.scan_counts["markets_filtered"] += n_removed
+        return filtered
 
     # ---------------------------------------------------------------- Main Loop
 
@@ -250,6 +387,11 @@ class TradingOrchestrator:
                     await self._update_mtm()
                     self._last_mtm = now
 
+                # Periodic portfolio status (every 60s for no-dashboard mode)
+                if now - self._last_status_log >= 60.0:
+                    self._log_portfolio_status()
+                    self._last_status_log = now
+
                 await self._state.tick()
 
             except asyncio.CancelledError:
@@ -264,13 +406,13 @@ class TradingOrchestrator:
     async def _refresh_markets(self) -> None:
         """Fetch fresh market data from both exchanges."""
         try:
-            poly_markets = await self._poly_feed.fetch_active_markets(limit=200)
+            poly_markets = await self._poly_feed.fetch_active_markets(limit=1000)
             await self._state.upsert_markets(poly_markets)
         except Exception as exc:
             logger.warning("Polymarket market refresh failed: %s", exc)
 
         try:
-            kalshi_markets = await self._kalshi_feed.fetch_active_markets(limit=200)
+            kalshi_markets = await self._kalshi_feed.fetch_active_markets(limit=1000)
             await self._state.upsert_markets(kalshi_markets)
         except Exception as exc:
             logger.warning("Kalshi market refresh failed: %s", exc)
@@ -306,35 +448,81 @@ class TradingOrchestrator:
         if not markets:
             return
 
-        poly_markets = [m for m in markets if m.exchange == Exchange.POLYMARKET]
-        kalshi_markets = [m for m in markets if m.exchange == Exchange.KALSHI]
-        logger.info(
-            "ARB SCAN — checking %d Polymarket × %d Kalshi markets for price discrepancies",
-            len(poly_markets), len(kalshi_markets),
-        )
+        markets = self._filter_markets(markets)
+        self.scan_counts["arb_scans"] += 1
 
         opportunities = self._arb_scanner.scan(markets)
         self.latest_arb_opportunities = opportunities[:20]
 
-        if not opportunities:
-            logger.info("ARB SCAN — no opportunities found (markets are efficiently priced)")
-        else:
+        if opportunities:
+            self.scan_counts["arb_found"] += len(opportunities)
             logger.info("ARB SCAN — found %d opportunities (%d actionable)",
                         len(opportunities), sum(1 for o in opportunities if o.is_actionable))
+            market_map = {m.market_id: m for m in markets}
+            
+            # Identify markets we already have positions in to avoid duplicates
+            held_markets = {p.market_id for p in self._portfolio.open_positions}
+            
+            executed = 0
+            blocked = 0
+            for opp in opportunities[:5]:
+                await self._db.log_arb_opportunity(opp)
+                
+                # Deduplicate: don't enter an arb if we already hold any of its markets
+                # OR if any of the markets are on a loss-cooldown
+                now_ts = time.monotonic()
+                if any(mid in held_markets for mid in opp.market_ids):
+                    continue
+                
+                if any(self._closed_at_loss_cooldown.get(mid, 0) > now_ts for mid in opp.market_ids):
+                    logger.debug("Skipping Arb %s due to loss cooldown on one or more legs", opp.opp_id[:8])
+                    continue
 
-        for opp in opportunities[:5]:  # log top 5
-            await self._db.log_arb_opportunity(opp)
-            if opp.is_actionable:
+                if opp.is_actionable:
+                    orders = await self._router.execute_arb(opp, market_map)
+                    if orders and len(orders) == len(opp.legs):
+                        executed += 1
+                        self._log_execution(
+                            "ARB", ", ".join(opp.market_ids[:2]),
+                            f"edge=${opp.net_edge_usd:.2f} aroc={opp.aroc_annual*100:.0f}%",
+                            "FILLED",
+                        )
+                        # Record each leg in the portfolio for tracking and P&L
+                        from src.core.models import Position, Side
+                        for i, order in enumerate(orders):
+                            leg_data = opp.legs[i]
+                            m = market_map.get(order.market_id)
+                            pos = Position(
+                                exchange=order.exchange,
+                                market_id=order.market_id,
+                                market_title=m.title if m else "Arb Leg",
+                                side=Side(leg_data["side"]),
+                                size_usd=order.filled_size_usd,
+                                entry_price=order.avg_fill_price or leg_data["price"],
+                                current_price=order.avg_fill_price or leg_data["price"],
+                                expiry=opp.expiry,
+                                is_paper=order.is_paper,
+                                signal_id=f"arb:{opp.opp_id}", # Tag as arb to disable stop-loss
+                            )
+                            # PortfolioManager handles cash deduction
+                            self._portfolio.open_position(pos, m)
+                            held_markets.add(order.market_id)
+                    else:
+                        blocked += 1
+            if blocked and not executed:
                 logger.info(
-                    "ARB EXECUTE — type=%s net_edge=$%.2f aroc=%.0f%% flags=%s",
-                    opp.alpha_type.value,
-                    opp.net_edge_usd,
-                    opp.aroc_annual * 100,
-                    [f.value for f in opp.risk_flags],
+                    "ARB SCAN — %d/%d blocked by risk guards (resolution risk, drawdown, etc.)",
+                    blocked, len(opportunities),
                 )
-                if self._settings.is_live or True:  # execute in paper mode too
-                    market_map = {m.market_id: m for m in markets}
-                    await self._router.execute_arb(opp, market_map)
+        else:
+            # Only log periodically to reduce noise
+            if self.scan_counts["arb_scans"] % 6 == 1:
+                poly_n = sum(1 for m in markets if m.exchange == Exchange.POLYMARKET)
+                kalshi_n = sum(1 for m in markets if m.exchange == Exchange.KALSHI)
+                logger.info(
+                    "ARB SCAN — 0 opportunities across %d poly × %d kalshi (efficiently priced)",
+                    poly_n, kalshi_n,
+                )
 
     async def _run_signal_scan(self) -> None:
         """Run all directional signal generators."""
@@ -342,6 +530,8 @@ class TradingOrchestrator:
         if not markets:
             return
 
+        markets = self._filter_markets(markets)
+        self.scan_counts["signal_scans"] += 1
         logger.info("SIGNAL SCAN — evaluating %d markets across 3 strategies", len(markets))
         all_signals: list[DirectionalSignal] = []
 
@@ -367,9 +557,31 @@ class TradingOrchestrator:
             )
 
         # 2. Time-decay signals (Poisson model: does market price decay fast enough?)
-        eligible = [m for m in markets if m.expiry and m.yes_outcome]
+        # Model probability is capped at 0.85 to prevent overconfidence on long-horizon
+        # markets. This allows scanning up to 30 days out while keeping edge realistic.
+        has_expiry = [m for m in markets if m.expiry and m.yes_outcome]
+        eligible = [
+            m for m in has_expiry
+            if m.days_to_expiry is not None
+            and 0 < m.days_to_expiry <= 30
+        ]
+        if self.scan_counts["signal_scans"] <= 2:
+            # Diagnostic logging on first few scans to help debug market coverage
+            dte_ranges = {"no_expiry": 0, "0-7d": 0, "7-14d": 0, "14-30d": 0, "30d+": 0}
+            for m in markets:
+                if not m.expiry or not m.yes_outcome:
+                    dte_ranges["no_expiry"] += 1
+                elif m.days_to_expiry is not None:
+                    d = m.days_to_expiry
+                    if d <= 7: dte_ranges["0-7d"] += 1
+                    elif d <= 14: dte_ranges["7-14d"] += 1
+                    elif d <= 30: dte_ranges["14-30d"] += 1
+                    else: dte_ranges["30d+"] += 1
+            logger.info(
+                "  [2/3] TIME DECAY — market breakdown: %s", dte_ranges,
+            )
         logger.info(
-            "  [2/3] TIME DECAY — checking %d markets with expiry and YES outcome",
+            "  [2/3] TIME DECAY — checking %d markets (expiry ≤30d, with YES outcome)",
             len(eligible),
         )
         td_count = 0
@@ -408,25 +620,50 @@ class TradingOrchestrator:
             mr_count,
         )
 
-        # Sort by EV and deduplicate by market_id
-        seen_markets = set()
+        # Sort by EV and deduplicate by market_id; also skip markets we already hold
+        held_markets = {p.market_id for p in self._portfolio.open_positions}
+        seen_markets: set[str] = set()
         unique_signals = []
+        skipped_held = 0
         for s in sorted(all_signals, key=lambda x: x.expected_value_usd, reverse=True):
-            if s.market_id not in seen_markets:
-                seen_markets.add(s.market_id)
-                unique_signals.append(s)
+            if s.market_id in seen_markets:
+                continue
+            seen_markets.add(s.market_id)
+            if s.market_id in held_markets:
+                skipped_held += 1
+                continue
+            unique_signals.append(s)
 
         self.latest_signals = unique_signals[:20]
 
         actionable = [s for s in unique_signals if s.is_actionable]
-        logger.info(
-            "SIGNAL SCAN COMPLETE — %d total signals, %d actionable, executing now",
-            len(unique_signals), len(actionable),
-        )
+        self.scan_counts["signals_found"] += len(unique_signals)
 
+        # Diagnostic: show why non-actionable signals are blocked
+        if unique_signals and not actionable:
+            reasons: dict[str, int] = {}
+            for s in unique_signals:
+                if s.expected_value_usd <= 0:
+                    reasons["EV<=0"] = reasons.get("EV<=0", 0) + 1
+                if s.edge < 0.02:
+                    reasons["edge<2%"] = reasons.get("edge<2%", 0) + 1
+                if RiskFlag.FEE_EXCESSIVE in s.risk_flags:
+                    reasons["fee_excessive"] = reasons.get("fee_excessive", 0) + 1
+                if RiskFlag.AROC_BELOW_MIN in s.risk_flags:
+                    reasons["aroc_low"] = reasons.get("aroc_low", 0) + 1
+            logger.info(
+                "SIGNAL SCAN COMPLETE — %d signals, 0 actionable (reasons: %s), %d skipped (already held)",
+                len(unique_signals), reasons, skipped_held,
+            )
+        else:
+            logger.info(
+                "SIGNAL SCAN COMPLETE — %d signals, %d actionable, %d skipped (already held)",
+                len(unique_signals), len(actionable), skipped_held,
+            )
+
+        executed_count = 0
         for signal in unique_signals:
             await self._db.log_signal(signal)
-            # Record in calibration tracker
             self._calibration.record_prediction(
                 signal_id=signal.signal_id,
                 market_id=signal.market_id,
@@ -435,27 +672,65 @@ class TradingOrchestrator:
                 predicted_prob=signal.true_probability,
             )
             if signal.is_actionable:
+                # Skip markets on cooldown (rejected/failed recently)
+                now_ts = time.monotonic()
+                cooldown_until = self._rejected_cooldown.get(signal.market_id, 0)
+                if now_ts < cooldown_until:
+                    continue
+
+                # Skip markets closed at a loss recently (cooldown)
+                loss_cooldown = self._closed_at_loss_cooldown.get(signal.market_id, 0)
+                if now_ts < loss_cooldown:
+                    logger.debug("Skipping market %s due to loss cooldown", signal.market_id[:24])
+                    continue
+
                 market = next((m for m in markets if m.market_id == signal.market_id), None)
                 if market:
                     # Apply drawdown-adjusted sizing before execution
                     dd = self._portfolio.drawdown
-                    if dd > 0.05:  # only scale once DD > 5%
+                    if dd > 0.05:
                         max_dd = self._settings.max_drawdown_pct
-                        scale = max(0.0, 1.0 - dd / max_dd)
+                        scale = max(0.25, 1.0 - dd / max_dd)
                         signal = signal.model_copy(update={
                             "recommended_size_usd": signal.recommended_size_usd * scale,
                         })
-                        logger.info(
-                            "  Drawdown %.1f%% — scaling %s size to $%.2f",
-                            dd * 100, signal.market_id[:20], signal.recommended_size_usd,
-                        )
                     logger.info(
                         "  EXECUTE %s [%s] %s size=$%.2f edge=%.1f%% EV=$%.2f",
                         signal.alpha_type.value, signal.market_id[:24],
                         signal.side.value, signal.recommended_size_usd,
                         signal.edge * 100, signal.expected_value_usd,
                     )
-                    await self._router.execute_signal(signal, market)
+                    order = await self._router.execute_signal(signal, market)
+                    if order and order.status.value == "filled":
+                        executed_count += 1
+                        self._log_execution(
+                            signal.alpha_type.value, market.market_id[:24],
+                            f"{signal.side.value} ${order.filled_size_usd:.0f} @ {signal.implied_probability:.1%} edge={signal.edge:.1%}",
+                            "FILLED",
+                        )
+                        from src.core.models import Position, Side
+                        pos = Position(
+                            exchange=market.exchange,
+                            market_id=market.market_id,
+                            market_title=market.title,
+                            side=signal.side,
+                            size_usd=order.filled_size_usd,
+                            entry_price=order.avg_fill_price or signal.implied_probability,
+                            current_price=order.avg_fill_price or signal.implied_probability,
+                            expiry=market.expiry,
+                            signal_id=signal.signal_id,
+                        )
+                        self._portfolio.open_position(pos, market)
+                    elif order:
+                        # Cooldown rejected/cancelled markets for 5 minutes
+                        if order.status.value in ("rejected", "cancelled"):
+                            self._rejected_cooldown[signal.market_id] = now_ts + 300.0
+                        self._log_execution(
+                            signal.alpha_type.value, market.market_id[:24],
+                            f"{signal.side.value} ${signal.recommended_size_usd:.0f}",
+                            order.status.value.upper(),
+                        )
+        self.scan_counts["signals_executed"] += executed_count
 
     async def _run_ofi_scan(self) -> None:
         """
@@ -465,6 +740,8 @@ class TradingOrchestrator:
         if self._http_session is None or self._http_session.closed:
             return
         markets = await self._state.get_all_markets(max_age_sec=120.0)
+        markets = self._filter_markets(markets)
+        self.scan_counts["ofi_scans"] += 1
         poly_markets = [
             m for m in markets
             if m.exchange == Exchange.POLYMARKET and m.yes_outcome
@@ -475,11 +752,6 @@ class TradingOrchestrator:
             key=lambda m: m.yes_outcome.volume_24h if m.yes_outcome else 0,
             reverse=True,
         )[:30]
-
-        logger.info(
-            "OFI SCAN — watching trade flow on top %d Polymarket markets by volume",
-            len(poly_markets),
-        )
 
         nav = self._portfolio.nav
         ofi_signals = await self._ofi_analyzer.scan_universe(
@@ -508,10 +780,16 @@ class TradingOrchestrator:
             reverse=True,
         )[:20]
 
-        logger.info(
-            "OFI SCAN — %d new signals from %d markets (looks for large buy/sell imbalances)",
-            new_count, len(poly_markets),
-        )
+        if new_count > 0:
+            logger.info(
+                "OFI SCAN — %d new signals from %d markets",
+                new_count, len(poly_markets),
+            )
+        elif self.scan_counts["ofi_scans"] % 6 == 1:
+            logger.info(
+                "OFI SCAN — 0 signals from %d markets (monitoring buy/sell imbalances)",
+                len(poly_markets),
+            )
 
     async def _run_near_expiry_scan(self) -> None:
         """
@@ -522,6 +800,7 @@ class TradingOrchestrator:
         We run this every 5 minutes instead of 30.
         """
         markets = await self._state.get_all_markets(max_age_sec=120.0)
+        markets = self._filter_markets(markets)
         near_expiry = [
             m for m in markets
             if m.days_to_expiry is not None
@@ -582,10 +861,47 @@ class TradingOrchestrator:
         for pos_id in finalisable:
             logger.info("Finalising UMA position %s after dispute period", pos_id[:8])
 
+        # Check stop losses
+        stop_positions = self._portfolio.check_stop_losses(POSITION_STOP_LOSS_PCT)
+        for pos_id in stop_positions:
+            pos = self._portfolio._positions.get(pos_id)
+            if pos:
+                self._log_execution(
+                    "STOP LOSS", pos.market_title[:24],
+                    f"loss={-pos.unrealised_pnl/pos.size_usd:.0%} > {POSITION_STOP_LOSS_PCT:.0%}",
+                    "EXIT",
+                )
+                self._portfolio.close_position(pos_id, pos.current_price, reason="stop_loss")
+                # Cooldown for 1 hour after a stop-loss exit to prevent the "death loop"
+                self._closed_at_loss_cooldown[pos.market_id] = time.monotonic() + 3600.0
+
         snapshot = self._portfolio.compute_snapshot()
         await self._state.set_portfolio_snapshot(snapshot)
 
-    # ---------------------------------------------------------------- Portfolio Access
+    # ---------------------------------------------------------------- Portfolio Status
+
+    def _log_portfolio_status(self) -> None:
+        """Log portfolio status periodically (for no-dashboard mode)."""
+        snap = self._portfolio.compute_snapshot()
+        positions = snap.positions
+        pos_summary = ""
+        for p in positions[:5]:
+            pnl_sign = "+" if p.unrealised_pnl >= 0 else ""
+            pos_summary += (
+                f"\n    {p.side.value.upper():<3} {p.market_title[:35]:<35} "
+                f"${p.size_usd:<6.0f} @{p.entry_price:.2f}->{p.current_price:.2f} "
+                f"{pnl_sign}${p.unrealised_pnl:.2f}"
+            )
+        if len(positions) > 5:
+            pos_summary += f"\n    ... and {len(positions) - 5} more"
+
+        logger.info(
+            "PORTFOLIO — NAV: $%.2f | Cash: $%.2f | Locked: $%.2f | "
+            "uPnL: $%.2f | rPnL: $%.2f | DD: %.1f%% | Positions: %d%s",
+            snap.total_nav_usd, snap.available_capital_usd, snap.locked_capital_usd,
+            snap.unrealised_pnl_usd, snap.realised_pnl_usd,
+            snap.current_drawdown_pct * 100, len(positions), pos_summary,
+        )
 
     def get_portfolio_snapshot(self):
         return self._portfolio.compute_snapshot()

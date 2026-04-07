@@ -61,6 +61,7 @@ class OracleFeed:
         self._session: Optional[aiohttp.ClientSession] = None
         self._cache: dict[str, OracleEstimate] = {}
         self._news_cache: list[NewsEvent] = []
+        self._newsapi_warned: bool = False
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession(
@@ -80,7 +81,9 @@ class OracleFeed:
         """Fetch recent news articles matching `query` via NewsAPI."""
         api_key = self._settings.newsapi_key
         if not api_key:
-            logger.warning("NEWSAPI_KEY not set — skipping news fetch")
+            if not self._newsapi_warned:
+                logger.warning("NEWSAPI_KEY not set — skipping news fetch (this warning will not repeat)")
+                self._newsapi_warned = True
             return []
 
         assert self._session is not None

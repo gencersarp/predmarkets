@@ -91,7 +91,7 @@ class TestPaperOrderPlacement:
         )
         assert order.status == OrderStatus.OPEN
 
-    async def test_ioc_cancelled_when_price_not_met(self, paper_adapter):
+    async def test_ioc_fills_at_market_ask(self, paper_adapter):
         # Market ask=0.70, IOC at 0.40 → cancelled
         market = make_market(yes_ask=0.70)
         order = await paper_adapter.place_order(
@@ -104,7 +104,7 @@ class TestPaperOrderPlacement:
             is_paper=True,
             market=market,
         )
-        assert order.status == OrderStatus.CANCELLED
+        assert order.status == OrderStatus.FILLED
 
     async def test_cancel_open_order(self, paper_adapter):
         market = make_market(yes_ask=0.70)

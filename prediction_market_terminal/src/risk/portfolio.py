@@ -230,7 +230,10 @@ class PortfolioManager:
         for pos in self._positions.values():
             if pos.status not in (PositionStatus.OPEN, PositionStatus.LOCKED):
                 continue
-            days = pos.days_locked or 30.0
+            if pos.expiry:
+                days = max(0.1, (pos.expiry - datetime.now(timezone.utc)).total_seconds() / 86400)
+            else:
+                days = 30.0
             expected_gain = pos.unrealised_pnl
             aroc = (expected_gain / max(pos.size_usd, 1.0)) * (365.0 / max(days, 1.0))
             report.append({
@@ -279,3 +282,39 @@ class PortfolioManager:
             p for p in self._positions.values()
             if p.status in (PositionStatus.OPEN, PositionStatus.LOCKED)
         ]
+
+    def has_position_in_market(self, market_id: str) -> bool:
+        return any(
+            p.market_id == market_id
+            for p in self._positions.values()
+            if p.status in (PositionStatus.OPEN, PositionStatus.LOCKED)
+        )
+
+    def get_position_for_market(self, market_id: str) -> Optional[Position]:
+        for p in self._positions.values():
+            if p.market_id == market_id and p.status in (PositionStatus.OPEN, PositionStatus.LOCKED):
+                return p
+        return None
+
+    def check_stop_losses(self, max_loss_pct: float = 0.50) -> list[str]:
+        """Return position_ids that have breached stop-loss threshold."""
+        stop_positions = []
+        for pos_id, pos in self._positions.items():
+            if pos.status != PositionStatus.OPEN:
+                continue
+            if pos.size_usd <= 0:
+                continue
+            
+            # Exempt Arbitrage legs from individual stop-losses
+            # They are delta-neutral and meant to hedge each other.
+            if pos.signal_id and pos.signal_id.startswith("arb:"):
+                continue
+
+            loss_pct = -pos.unrealised_pnl / pos.size_usd
+            if loss_pct >= max_loss_pct:
+                stop_positions.append(pos_id)
+                logger.warning(
+                    "STOP LOSS triggered for %s: loss=%.1f%% (threshold=%.1f%%)",
+                    pos_id[:8], loss_pct * 100, max_loss_pct * 100,
+                )
+        return stop_positions
