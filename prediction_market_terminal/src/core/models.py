@@ -72,7 +72,9 @@ class AlphaType(str, Enum):
     EV_DIRECTIONAL = "ev_directional"
     TIME_DECAY = "time_decay"
     MEAN_REVERSION = "mean_reversion"
-    ORDER_FLOW = "order_flow"          # order-flow imbalance / sharp money
+    MOMENTUM = "momentum"
+    ORDER_FLOW = "order_flow"
+          # order-flow imbalance / sharp money
 
 
 class RiskFlag(str, Enum):
