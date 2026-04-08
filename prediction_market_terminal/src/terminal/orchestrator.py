@@ -31,6 +31,7 @@ from src.alpha.arbitrage import ArbitrageScanner
 from src.alpha.calibration import get_calibration_tracker
 from src.alpha.fundamental import EVEngine
 from src.alpha.mean_reversion import MeanReversionDetector
+from src.alpha.trend_following import TrendFollowingDetector
 from src.alpha.orderflow import OrderFlowAnalyzer
 from src.alpha.time_decay import TimeDecaySignalGenerator, fit_poisson_model
 from src.core.constants import (
@@ -130,6 +131,7 @@ class TradingOrchestrator:
         self._arb_scanner = ArbitrageScanner()
         self._ev_engine = EVEngine(min_edge_pct=0.05)
         self._mr_detector = MeanReversionDetector(min_edge=0.03)
+        self._trend_detector = TrendFollowingDetector()
         self._td_generator = TimeDecaySignalGenerator(min_edge=0.03)
         self._ofi_analyzer = OrderFlowAnalyzer()
         self._calibration = get_calibration_tracker()
@@ -532,7 +534,7 @@ class TradingOrchestrator:
 
         markets = self._filter_markets(markets)
         self.scan_counts["signal_scans"] += 1
-        logger.info("SIGNAL SCAN — evaluating %d markets across 3 strategies", len(markets))
+        logger.info("SIGNAL SCAN — evaluating %d markets across 4 strategies", len(markets))
         all_signals: list[DirectionalSignal] = []
 
         # 1. EV-based fundamental signals (requires oracle/news data)
@@ -599,25 +601,36 @@ class TradingOrchestrator:
                         signal.implied_probability * 100,
                         signal.edge * 100,
                     )
-        logger.info("  [2/3] TIME DECAY — %d signals from %d eligible markets", td_count, len(eligible))
+        logger.info("  [2/4] TIME DECAY — %d signals from %d eligible markets", td_count, len(eligible))
 
         # 3. Mean-reversion signals (requires price history — builds up over time)
         mr_count = 0
+        trend_count = 0
         for market in markets:
             if market.implied_prob_yes_mid is not None:
-                self._mr_detector.update(
-                    market.market_id,
-                    market.implied_prob_yes_mid,
-                    market.yes_outcome.volume_24h if market.yes_outcome else 0.0,
-                )
+                vol = market.yes_outcome.volume_24h if market.yes_outcome else 0.0
+                self._mr_detector.update(market.market_id, market.implied_prob_yes_mid, vol)
+                self._trend_detector.update(market.market_id, market.implied_prob_yes_mid, vol)
+
             oracle_prob = await self._state.get_consensus_probability(market.market_id)
+            
+            # MR check
             mr_signal = self._mr_detector.detect_overreaction(market, oracle_prob)
             if mr_signal:
                 all_signals.append(mr_signal)
                 mr_count += 1
+            
+            # Trend check
+            trend_signal = self._trend_detector.detect_trend(market)
+            if trend_signal:
+                all_signals.append(trend_signal)
+                trend_count += 1
+
         logger.info(
-            "  [3/3] MEAN REVERSION — %d signals (needs price history; more signals appear over time)",
-            mr_count,
+            "  [3/4] MEAN REVERSION — %d signals", mr_count
+        )
+        logger.info(
+            "  [4/4] TREND FOLLOWING — %d signals", trend_count
         )
 
         # Sort by EV and deduplicate by market_id; also skip markets we already hold
