@@ -21,10 +21,12 @@ from src.core.constants import (
     MIN_MARKET_VOLUME_24H_USD,
     MIN_TRADEABLE_PROB,
     MAX_TRADEABLE_PROB,
+    MAX_DAILY_LOSS_PCT,
 )
 from src.core.exceptions import (
     CorrelationLimitBreached,
     DrawdownLimitBreached,
+    DailyLossLimitBreached,
     GasLimitExceeded,
     PaperModeViolation,
     PositionSizeTooLarge,
@@ -78,6 +80,18 @@ def guard_drawdown(portfolio: PortfolioManager) -> GuardResult:
             limit=settings.max_drawdown_pct,
         )
     return GuardResult(passed=True, guard_name="drawdown", reason=f"DD={dd:.2%}")
+
+
+def guard_daily_loss(portfolio: PortfolioManager) -> GuardResult:
+    """Block new positions if daily loss limit is breached."""
+    loss = portfolio.daily_loss_pct
+    if loss >= MAX_DAILY_LOSS_PCT:
+        raise DailyLossLimitBreached(
+            limit_name="max_daily_loss",
+            current=loss,
+            limit=MAX_DAILY_LOSS_PCT,
+        )
+    return GuardResult(passed=True, guard_name="daily_loss", reason=f"loss={loss:.2%}")
 
 
 def guard_position_size(size_usd: float) -> GuardResult:
@@ -271,6 +285,7 @@ class RiskGuardRunner:
         guards_to_run = [
             lambda: guard_paper_mode(is_live_order),
             lambda: guard_drawdown(portfolio),
+            lambda: guard_daily_loss(portfolio),
             lambda: guard_position_size(signal.recommended_size_usd),
             lambda: guard_stale_data(market),
             lambda: guard_probability_bounds(signal.implied_probability),
@@ -312,6 +327,7 @@ class RiskGuardRunner:
 
         results.append(guard_paper_mode(is_live_order))
         results.append(guard_drawdown(portfolio))
+        results.append(guard_daily_loss(portfolio))
         results.append(guard_position_size(opportunity.required_capital_usd))
         results.append(guard_resolution_risk(opportunity))
         results.append(guard_aroc(opportunity.aroc_annual))

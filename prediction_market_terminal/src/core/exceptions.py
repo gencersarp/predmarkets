@@ -58,6 +58,10 @@ class DrawdownLimitBreached(RiskLimitBreached):
     """Max drawdown circuit breaker triggered."""
 
 
+class DailyLossLimitBreached(RiskLimitBreached):
+    """Daily loss circuit breaker triggered."""
+
+
 class CorrelationLimitBreached(RiskLimitBreached):
     """Factor correlation cap hit."""
 

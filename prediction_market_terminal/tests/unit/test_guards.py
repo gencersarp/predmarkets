@@ -6,6 +6,7 @@ import pytest
 from src.core.exceptions import (
     CorrelationLimitBreached,
     DrawdownLimitBreached,
+    DailyLossLimitBreached,
     GasLimitExceeded,
     PaperModeViolation,
     PositionSizeTooLarge,
@@ -19,6 +20,7 @@ from src.risk.guards import (
     RiskGuardRunner,
     guard_aroc,
     guard_drawdown,
+    guard_daily_loss,
     guard_fee_consumption,
     guard_gas_price,
     guard_liquidity,
@@ -108,15 +110,27 @@ class TestGuardProbabilityBounds:
 
     def test_near_zero_raises(self):
         with pytest.raises(RiskLimitBreached):
-            guard_probability_bounds(0.005)  # below 0.01 floor
+            guard_probability_bounds(0.02)  # below 0.05 floor
 
     def test_near_one_raises(self):
         with pytest.raises(RiskLimitBreached):
-            guard_probability_bounds(0.98)  # above 0.97 ceiling
+            guard_probability_bounds(0.98)  # above 0.95 ceiling
 
     def test_boundary_values_pass(self):
-        assert guard_probability_bounds(0.01).passed
-        assert guard_probability_bounds(0.97).passed
+        assert guard_probability_bounds(0.05).passed
+        assert guard_probability_bounds(0.95).passed
+
+
+class TestGuardDailyLoss:
+    def test_passes_with_no_loss(self, healthy_portfolio, mocker):
+        mocker.patch.object(PortfolioManager, "daily_loss_pct", new_callable=mocker.PropertyMock, return_value=0.01)
+        result = guard_daily_loss(healthy_portfolio)
+        assert result.passed
+
+    def test_raises_when_limit_breached(self, healthy_portfolio, mocker):
+        mocker.patch.object(PortfolioManager, "daily_loss_pct", new_callable=mocker.PropertyMock, return_value=0.06)
+        with pytest.raises(DailyLossLimitBreached):
+            guard_daily_loss(healthy_portfolio)
 
 
 class TestGuardLiquidity:

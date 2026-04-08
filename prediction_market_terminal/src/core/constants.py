@@ -76,3 +76,4 @@ MARKET_TITLE_BLACKLIST_PATTERNS: list[str] = [
 
 # ---- Position stop loss ---------------------------------------------------
 POSITION_STOP_LOSS_PCT: float = 0.20        # exit if loss > 20% of position size
+MAX_DAILY_LOSS_PCT: float = 0.05            # Halt trading if NAV drops > 5% in 24h

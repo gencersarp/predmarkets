@@ -42,6 +42,10 @@ class PortfolioManager:
         self._realised_pnl: float = 0.0
         self._peak_nav: float = initial_nav_usd
         self._factor_tracker = FactorExposureTracker()
+        # Track NAV history for daily loss limits (timestamp, nav)
+        self._nav_history: list[tuple[datetime, float]] = [
+            (datetime.now(timezone.utc), initial_nav_usd)
+        ]
 
     # ---------------------------------------------------------------- Position Management
 
@@ -209,6 +213,14 @@ class PortfolioManager:
         self._peak_nav = max(self._peak_nav, nav)
         drawdown = (self._peak_nav - nav) / max(self._peak_nav, 1.0)
 
+        # Update history
+        now = datetime.now(timezone.utc)
+        self._nav_history.append((now, nav))
+        day_ago = now - timedelta(hours=24)
+        self._nav_history = [h for h in self._nav_history if h[0] > day_ago]
+        if not self._nav_history:
+            self._nav_history = [(now, nav)]
+
         return PortfolioSnapshot(
             total_nav_usd=nav,
             available_capital_usd=self._cash_usd,
@@ -220,6 +232,22 @@ class PortfolioManager:
             positions=list(open_pos),
             factor_exposures=self._factor_tracker.get_exposure_pct(nav),
         )
+
+    @property
+    def daily_loss_pct(self) -> float:
+        """Calculate max peak-to-trough NAV loss over the last 24h."""
+        if len(self._nav_history) < 2:
+            return 0.0
+        
+        # NAV at beginning of 24h window (first entry)
+        start_nav = self._nav_history[0][1]
+        # Current NAV (last entry)
+        curr_nav = self._nav_history[-1][1]
+        
+        # We calculate the loss relative to the 24h start NAV
+        # If curr_nav < start_nav, it's a loss.
+        loss = max(0.0, (start_nav - curr_nav) / max(start_nav, 1.0))
+        return loss
 
     def aroc_report(self) -> list[dict]:
         """
